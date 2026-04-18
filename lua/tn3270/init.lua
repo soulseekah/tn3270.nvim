@@ -4,6 +4,7 @@ local Telnet = require('tn3270.telnet')
 local Screen = require('tn3270.screen')
 local stream = require('tn3270.stream')
 local ebcdic = require('tn3270.ebcdic')
+local editmode = require('tn3270.editmode')
 
 local M = {}
 
@@ -37,6 +38,8 @@ local function send_command(client, cmd, option)
 end
 
 local AID_ENTER = 0x7D
+local AID_CLEAR = 0x6D
+local AID_PA = { [1]=0x6C, [2]=0x6E }
 local AID_PF = {
     [1]=0xF1, [2]=0xF2, [3]=0xF3, [4]=0xF4, [5]=0xF5, [6]=0xF6,
     [7]=0xF7, [8]=0xF8, [9]=0xF9, [10]=0x7A, [11]=0x7B, [12]=0x7C,
@@ -60,20 +63,22 @@ local function encode_address(addr)
            ADDR_TABLE[bit.band(addr, 0x3F)]
 end
 
-local function send_aid(client, aid, screen)
+local function send_aid(client, aid, screen, short)
     local bytes = {}
     bytes[#bytes + 1] = aid
     local b1, b2 = encode_address(screen.cursor)
     bytes[#bytes + 1] = b1
     bytes[#bytes + 1] = b2
 
-    for _, field in ipairs(screen:modified_fields()) do
-        bytes[#bytes + 1] = 0x11 -- SBA
-        local fb1, fb2 = encode_address(field.start)
-        bytes[#bytes + 1] = fb1
-        bytes[#bytes + 1] = fb2
-        for _, db in ipairs(field.data) do
-            bytes[#bytes + 1] = db
+    if not short then
+        for _, field in ipairs(screen:modified_fields()) do
+            bytes[#bytes + 1] = 0x11 -- SBA
+            local fb1, fb2 = encode_address(field.start)
+            bytes[#bytes + 1] = fb1
+            bytes[#bytes + 1] = fb2
+            for _, db in ipairs(field.data) do
+                bytes[#bytes + 1] = db
+            end
         end
     end
 
@@ -247,6 +252,7 @@ function M.connect()
             if #data_buf > 0 then
                 trace(string.format('=== EOR %d bytes ===', #data_buf))
                 local result = stream.process(screen, data_buf, trace)
+                screen.mode = editmode.detect(screen)
                 dump_screen()
                 data_buf = {}
                 if result == 'wsf_query' then
@@ -269,15 +275,20 @@ function M.connect()
 
         vim.schedule(function()
             vim.api.nvim_buf_set_lines(buf, 0, -1, false, {'Connected to 127.0.0.1:3270', ''})
-            vim.keymap.set('n', '<CR>', function()
+            local function submit_enter()
                 if screen.locked then return end
                 local lines = vim.api.nvim_buf_get_lines(buf, 0, screen.rows, false)
                 screen:sync_from_lines(lines)
-                -- Sync vim cursor position back to screen model
                 local pos = vim.api.nvim_win_get_cursor(0)
                 screen.cursor = (pos[1] - 1) * screen.cols + pos[2]
                 send_aid(client, AID_ENTER, screen)
                 screen.locked = true
+            end
+
+            vim.keymap.set('n', '<CR>', submit_enter, { buffer = buf })
+            vim.keymap.set('i', '<CR>', function()
+                vim.cmd('stopinsert')
+                submit_enter()
             end, { buffer = buf })
             vim.keymap.set('n', '<Tab>', function()
                 local lines = vim.api.nvim_buf_get_lines(buf, 0, screen.rows, false)
@@ -295,6 +306,43 @@ function M.connect()
             end, { buffer = buf })
             vim.keymap.set('n', 'i', 'R', { buffer = buf })
             vim.keymap.set('n', 'I', 'R', { buffer = buf })
+
+            for _, key in ipairs({'p', 'P', 'x', 'X', 'D', 'J', 'cc', 'C', 's', 'S'}) do
+                vim.keymap.set('n', key, '<Nop>', { buffer = buf })
+            end
+
+            editmode.setup(buf, screen, function()
+                local cpos = vim.api.nvim_win_get_cursor(0)
+                screen.cursor = (cpos[1] - 1) * screen.cols + cpos[2]
+                send_aid(client, AID_ENTER, screen)
+                screen.locked = true
+            end)
+
+            vim.api.nvim_create_autocmd('QuitPre', {
+                buffer = buf,
+                callback = function()
+                    local data_start = screen:next_field(screen.size - 1)
+                    local attr_pos = (data_start - 1 + screen.size) % screen.size
+                    if screen.attrs[attr_pos + 1] then
+                        local field_end = screen:field_end(attr_pos)
+                        local text = 'TSO LOGOFF'
+                        for p = data_start, field_end do
+                            local i = p - data_start + 1
+                            if i <= #text then
+                                screen:put(p, ebcdic.encode(text:sub(i, i)))
+                            else
+                                screen:put(p, 0x40)
+                            end
+                        end
+                        screen:set_mdt(attr_pos)
+                        screen.cursor = data_start + #text
+                        send_aid(client, AID_ENTER, screen)
+                        vim.wait(500, function() return false end)
+                    end
+                    pcall(function() client:shutdown() end)
+                    pcall(function() client:close() end)
+                end,
+            })
 
             vim.keymap.set('n', '<leader>h', function()
                 local lines = vim.api.nvim_buf_get_lines(buf, 0, screen.rows, false)
@@ -314,6 +362,25 @@ function M.connect()
                     screen.locked = true
                 end, { buffer = buf })
             end
+
+            vim.keymap.set('n', '<PageUp>', '<leader>pf7', { buffer = buf, remap = true })
+            vim.keymap.set('n', '<PageDown>', '<leader>pf8', { buffer = buf, remap = true })
+
+            for n, aid in pairs(AID_PA) do
+                vim.keymap.set('n', string.format('<leader>pa%d', n), function()
+                    local pos = vim.api.nvim_win_get_cursor(0)
+                    screen.cursor = (pos[1] - 1) * screen.cols + pos[2]
+                    send_aid(client, aid, screen, true)
+                    screen.locked = true
+                end, { buffer = buf })
+            end
+
+            vim.keymap.set('n', '<leader>pcl', function()
+                screen:clear()
+                send_aid(client, AID_CLEAR, screen, true)
+                screen.locked = true
+                update_display(buf, screen)
+            end, { buffer = buf })
         end)
 
         client:read_start(function(err, data)

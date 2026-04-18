@@ -73,10 +73,10 @@ function M.process(screen, data, log)
             local target = decode_address(data[pos + 1], data[pos + 2])
             local fill = data[pos + 3]
             log(string.format('[%04d] RA fill=0x%02X %d->%d', p, fill, addr, target))
-            while addr ~= target do
+            repeat
                 screen:put(addr, fill)
                 addr = (addr + 1) % screen.size
-            end
+            until addr == target
             pos = pos + 4
         elseif byte == ORDER_PT then
             log(string.format('[%04d] PT', p))
