@@ -5,8 +5,15 @@ local Screen = require('tn3270.screen')
 local stream = require('tn3270.stream')
 local ebcdic = require('tn3270.ebcdic')
 local editmode = require('tn3270.editmode')
+local transfer = require('tn3270.transfer')
+local detect = require('tn3270.detect')
+local config = require('tn3270.config')
 
 local M = {}
+
+M.setup = config.setup
+
+local active = nil  -- one in-flight connection at a time
 
 local function log(buf, msg)
     vim.schedule(function()
@@ -126,23 +133,61 @@ local function send_query_reply(client)
     add_sf({0x81, 0x80,
         0x80, -- summary
         0x81, -- usable area
+        0x84, -- alphanumeric partitions
+        0x86, -- color
+        0x87, -- highlighting
+        0x88, -- reply modes
         0xA6, -- implicit partition
     })
 
-    -- QCODE 0x81: Usable Area (screen dimensions)
+    -- QCODE 0x81: Usable Area (matches c3270's layout; model 3 80x32)
     add_sf({0x81, 0x81,
         0x01,       -- 12-bit addressing
-        0x00, 0x00, -- flags
+        0x00,       -- flags
         0x00, 0x50, -- width: 80
-        0x00, 0x20, -- height: 32 (model 3)
+        0x00, 0x20, -- height: 32
         0x01,       -- units: character cell
         0x00, 0x0A, -- default cell width
         0x02, 0xE5, -- default cell height
-        0x00, 0x50, -- alternate width: 80
-        0x00, 0x20, -- alternate height: 32
+        0x00, 0x02, -- partition ID / max partitions
+        0x00, 0x6F, -- buffer chars max (unused)
+        0x09, 0x0C, 0x0D, 0x70, -- unknown (from c3270)
     })
 
+    -- QCODE 0x84: Alphanumeric Partitions
+    add_sf({0x81, 0x84,
+        0x00,       -- partitions
+        0x0D, 0x70, -- total buffer chars
+        0x00,       -- flags
+    })
 
+    -- QCODE 0x86: Color (8 base colors plus 8 extended)
+    add_sf({0x81, 0x86,
+        0x00, -- flags
+        0x10, -- 16 color pairs follow
+        0x00, 0xF4, -- default base attribute -> green
+        0xF1, 0xF1, 0xF2, 0xF2, 0xF3, 0xF3, 0xF4, 0xF4,
+        0xF5, 0xF5, 0xF6, 0xF6, 0xF7, 0xF7, 0xF8, 0xF8,
+        0xF9, 0xF9, 0xFA, 0xFA, 0xFB, 0xFB, 0xFC, 0xFC,
+        0xFD, 0xFD, 0xFE, 0xFE, 0xFF, 0xFF,
+    })
+
+    -- QCODE 0x87: Highlighting
+    add_sf({0x81, 0x87,
+        0x05, -- 5 highlight pairs
+        0x00, 0x00, -- default
+        0xF1, 0xF1, -- blink
+        0xF2, 0xF2, -- reverse
+        0xF4, 0xF4, -- underscore
+        0xF8, 0xF8, -- intensify
+    })
+
+    -- QCODE 0x88: Reply Modes (enables IND$FILE structured-field responses)
+    add_sf({0x81, 0x88,
+        0x00, -- field mode
+        0x01, -- extended field mode
+        0x02, -- character mode
+    })
 
     -- QCODE 0xA6: Implicit Partition (default/alternate screen sizes)
     add_sf({0x81, 0xA6,
@@ -165,25 +210,108 @@ end
 
 local ns = vim.api.nvim_create_namespace('tn3270')
 
-local function update_display(buf, screen)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, screen:to_lines())
+local COLOR_NAME = {
+    [0xF0] = 'Neutral',   [0xF1] = 'Blue',  [0xF2] = 'Red',    [0xF3] = 'Pink',
+    [0xF4] = 'Green',     [0xF5] = 'Turquoise', [0xF6] = 'Yellow', [0xF7] = 'White',
+}
 
-    -- Position nvim cursor to match 3270 cursor
-    local row = math.floor(screen.cursor / screen.cols)
-    local col = screen.cursor % screen.cols
-    pcall(vim.api.nvim_win_set_cursor, 0, {row + 1, col})
+local HL_NAME = {
+    [0xF1] = 'Tn3270Blink',
+    [0xF2] = 'Tn3270Reverse',
+    [0xF4] = 'Tn3270Underline',
+    [0xF8] = 'Tn3270Bold',
+}
 
-    -- TODO: highlight unprotected fields when color support is added
+local function setup_highlights()
+    local fg = {
+        Neutral   = { ctermfg = 'NONE', fg = 'NONE' },
+        Blue      = { ctermfg = 75,     fg = '#5f9fff' },
+        Red       = { ctermfg = 196,    fg = '#ff5f5f' },
+        Pink      = { ctermfg = 213,    fg = '#ff87d7' },
+        Green     = { ctermfg = 46,     fg = '#5fff5f' },
+        Turquoise = { ctermfg = 51,     fg = '#5fffff' },
+        Yellow    = { ctermfg = 226,    fg = '#ffff5f' },
+        White     = { ctermfg = 231,    fg = '#ffffff' },
+    }
+    for name, def in pairs(fg) do
+        vim.api.nvim_set_hl(0, 'Tn3270' .. name,
+            { ctermfg = def.ctermfg, fg = def.fg, default = true })
+        local bg = {
+            ctermbg = def.ctermfg ~= 'NONE' and def.ctermfg or nil,
+            bg = def.fg ~= 'NONE' and def.fg or nil,
+            default = true,
+        }
+        vim.api.nvim_set_hl(0, 'Tn3270Bg' .. name, bg)
+    end
+    vim.api.nvim_set_hl(0, 'Tn3270Reverse',   { reverse = true,   default = true })
+    vim.api.nvim_set_hl(0, 'Tn3270Underline', { underline = true, default = true })
+    vim.api.nvim_set_hl(0, 'Tn3270Bold',      { bold = true,      default = true })
+    vim.api.nvim_set_hl(0, 'Tn3270Blink',     { undercurl = true, default = true })
 end
 
-function M.connect()
+setup_highlights()
+
+local function update_display(buf, screen)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, screen:to_lines())
+    vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+
+    for row = 0, screen.rows - 1 do
+        local col = 0
+        while col < screen.cols do
+            local pos = row * screen.cols + col
+            local fg, bg, hl = screen:cell_style(pos)
+            local end_col = col + 1
+            while end_col < screen.cols do
+                local p2 = row * screen.cols + end_col
+                local fg2, bg2, hl2 = screen:cell_style(p2)
+                if fg2 ~= fg or bg2 ~= bg or hl2 ~= hl then break end
+                end_col = end_col + 1
+            end
+            local fg_name = COLOR_NAME[fg]
+            if fg_name then
+                vim.api.nvim_buf_set_extmark(buf, ns, row, col, {
+                    end_col = end_col,
+                    hl_group = 'Tn3270' .. fg_name,
+                    priority = 100,
+                })
+            end
+            local bg_name = COLOR_NAME[bg]
+            if bg ~= 0 and bg_name then
+                vim.api.nvim_buf_set_extmark(buf, ns, row, col, {
+                    end_col = end_col,
+                    hl_group = 'Tn3270Bg' .. bg_name,
+                    priority = 110,
+                })
+            end
+            local mod_name = HL_NAME[hl]
+            if mod_name then
+                vim.api.nvim_buf_set_extmark(buf, ns, row, col, {
+                    end_col = end_col,
+                    hl_group = mod_name,
+                    priority = 120,
+                })
+            end
+            col = end_col
+        end
+    end
+
+    local cur_row = math.floor(screen.cursor / screen.cols)
+    local cur_col = screen.cursor % screen.cols
+    pcall(vim.api.nvim_win_set_cursor, 0, {cur_row + 1, cur_col})
+end
+
+function M.connect(opts)
+    if active then M.disconnect() end
+    local cfg = config.get(opts)
+
     local buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_set_current_buf(buf)
     vim.bo[buf].buftype = 'nofile'
 
-    local logfile = io.open('tn3270.log', 'w')
+    local logfile = cfg.debug and io.open(cfg.log_file, 'w') or nil
     local screen = Screen.new(32, 80)
     local data_buf = {}
+    local autologin_state = cfg.autologin and 'logon' or 'done'
 
     local function trace(line)
         if logfile then
@@ -204,6 +332,96 @@ function M.connect()
     end
 
     local client = uv.new_tcp()
+
+    local function write_to_cursor_field(text)
+        local attr_pos = screen:field_attr_at(screen.cursor)
+        if not attr_pos then return false end
+        if bit.band(screen.attrs[attr_pos + 1], 0x20) ~= 0 then return false end
+        local data_start = (attr_pos + 1) % screen.size
+        local field_end = screen:field_end(attr_pos)
+        for p = data_start, field_end do
+            local i = p - data_start + 1
+            if i <= #text then
+                screen:put(p, ebcdic.encode(text:sub(i, i)))
+            else
+                screen:put(p, 0x40)
+            end
+        end
+        screen:set_mdt(attr_pos)
+        screen.cursor = data_start + #text
+        return true
+    end
+
+    local function write_to_command_field(text)
+        local data_start = screen:next_field(screen.size - 1)
+        local attr_pos = (data_start - 1 + screen.size) % screen.size
+        if not screen.attrs[attr_pos + 1] then return false end
+        if bit.band(screen.attrs[attr_pos + 1], 0x20) ~= 0 then return false end
+        local field_end = screen:field_end(attr_pos)
+        for p = data_start, field_end do
+            local i = p - data_start + 1
+            if i <= #text then
+                screen:put(p, ebcdic.encode(text:sub(i, i)))
+            else
+                screen:put(p, 0x40)
+            end
+        end
+        screen:set_mdt(attr_pos)
+        screen.cursor = data_start + #text
+        return true
+    end
+
+    local function logoff_from_ready()
+        if not write_to_cursor_field('LOGOFF') then return end
+        send_aid(client, AID_ENTER, screen)
+        screen.locked = true
+        vim.wait(1500, function() return false end)
+    end
+
+    local function exit_ispf_then_logoff()
+        if not write_to_cursor_field('X') then return end
+        send_aid(client, AID_ENTER, screen)
+        screen.locked = true
+        vim.wait(2000, function() return screen.mode == 'tso_ready' end)
+        if screen.mode == 'tso_ready' then logoff_from_ready() end
+    end
+
+    local function jump_exit_then_logoff()
+        if not write_to_command_field('=X') then return end
+        send_aid(client, AID_ENTER, screen)
+        screen.locked = true
+        vim.wait(2500, function() return screen.mode == 'tso_ready' end)
+        if screen.mode == 'tso_ready' then logoff_from_ready() end
+    end
+
+    local function run_logoff_for_mode()
+        if screen.mode == 'ispf_primary' then
+            exit_ispf_then_logoff()
+        elseif screen.mode == 'revedit' then
+            jump_exit_then_logoff()
+        elseif screen.mode == 'tso_ready' then
+            logoff_from_ready()
+        end
+    end
+
+    local function handle_autologin()
+        if not cfg.autologin or autologin_state == 'done' then return end
+        if autologin_state == 'logon' and screen.mode == 'tso_logon' then
+            if write_to_command_field('LOGON ' .. cfg.autologin.userid) then
+                send_aid(client, AID_ENTER, screen)
+                screen.locked = true
+                autologin_state = 'password'
+            end
+        elseif autologin_state == 'password' and screen.mode == 'tso_password' then
+            if write_to_cursor_field(cfg.autologin.password) then
+                send_aid(client, AID_ENTER, screen)
+                screen.locked = true
+                autologin_state = 'finishing'
+            end
+        elseif screen.mode == 'ispf_primary' or screen.mode == 'tso_ready' then
+            autologin_state = 'done'
+        end
+    end
 
     local telnet = Telnet.new({
         on_do = function(option)
@@ -251,30 +469,47 @@ function M.connect()
         on_eor = function()
             if #data_buf > 0 then
                 trace(string.format('=== EOR %d bytes ===', #data_buf))
-                local result = stream.process(screen, data_buf, trace)
-                screen.mode = editmode.detect(screen)
+                local result = stream.process(screen, data_buf, trace, {
+                    sf = function(sf_id, sf_data)
+                        if sf_id == 0xD0 then
+                            transfer.handle_sf(sf_data, { trace = trace, client = client })
+                        end
+                    end,
+                })
+                screen.mode = detect.detect(screen)
+                trace(string.format('[mode] %s', screen.mode))
                 dump_screen()
                 data_buf = {}
+                handle_autologin()
                 if result == 'wsf_query' then
                     send_query_reply(client)
                 else
                     vim.schedule(function()
                         update_display(buf, screen)
+                        transfer.step(screen, {
+                            trace = trace,
+                            submit = function()
+                                send_aid(client, AID_ENTER, screen)
+                                screen.locked = true
+                            end,
+                        })
                     end)
                 end
             end
         end,
     })
 
-    local port = 3271
-    client:connect('127.0.0.1', port, function(err)
+    active = { client = client, run_logoff = run_logoff_for_mode }
+
+    client:connect(cfg.host, cfg.port, function(err)
         if err then
             log(buf, 'ERROR: ' .. err)
             return
         end
 
         vim.schedule(function()
-            vim.api.nvim_buf_set_lines(buf, 0, -1, false, {'Connected to 127.0.0.1:3270', ''})
+            vim.api.nvim_buf_set_lines(buf, 0, -1, false,
+                {string.format('Connected to %s:%d', cfg.host, cfg.port), ''})
             local function submit_enter()
                 if screen.locked then return end
                 local lines = vim.api.nvim_buf_get_lines(buf, 0, screen.rows, false)
@@ -307,41 +542,55 @@ function M.connect()
             vim.keymap.set('n', 'i', 'R', { buffer = buf })
             vim.keymap.set('n', 'I', 'R', { buffer = buf })
 
+            local masking = false
+            vim.api.nvim_create_autocmd('TextChangedI', {
+                buffer = buf,
+                callback = function()
+                    if masking then return end
+                    local cpos = vim.api.nvim_win_get_cursor(0)
+                    local row, col = cpos[1] - 1, cpos[2] - 1
+                    if col < 0 then return end
+                    local pos = row * screen.cols + col
+                    local attr_pos = screen:field_attr_at(pos)
+                    if not attr_pos or not screen.attrs[attr_pos + 1] then return end
+                    if bit.band(screen.attrs[attr_pos + 1], 0x0C) ~= 0x0C then return end
+                    local line = (vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1]) or ''
+                    local typed = line:sub(col + 1, col + 1)
+                    if typed == '' or typed == '*' then return end
+                    screen.buffer[pos + 1] = ebcdic.encode(typed)
+                    screen:set_mdt(attr_pos)
+                    masking = true
+                    local masked = line:sub(1, col) .. '*' .. line:sub(col + 2)
+                    vim.api.nvim_buf_set_lines(buf, row, row + 1, false, { masked })
+                    pcall(vim.api.nvim_win_set_cursor, 0, { row + 1, col + 1 })
+                    masking = false
+                end,
+            })
+
             for _, key in ipairs({'p', 'P', 'x', 'X', 'D', 'J', 'cc', 'C', 's', 'S'}) do
                 vim.keymap.set('n', key, '<Nop>', { buffer = buf })
             end
 
-            editmode.setup(buf, screen, function()
+            local submit_enter_at_cursor = function()
                 local cpos = vim.api.nvim_win_get_cursor(0)
                 screen.cursor = (cpos[1] - 1) * screen.cols + cpos[2]
                 send_aid(client, AID_ENTER, screen)
                 screen.locked = true
-            end)
+            end
+
+            editmode.setup(buf, screen, submit_enter_at_cursor)
+            transfer.setup(buf, screen, {
+                trace = trace,
+                client = client,
+                send_enter = function()
+                    send_aid(client, AID_ENTER, screen)
+                    screen.locked = true
+                end,
+            })
 
             vim.api.nvim_create_autocmd('QuitPre', {
                 buffer = buf,
-                callback = function()
-                    local data_start = screen:next_field(screen.size - 1)
-                    local attr_pos = (data_start - 1 + screen.size) % screen.size
-                    if screen.attrs[attr_pos + 1] then
-                        local field_end = screen:field_end(attr_pos)
-                        local text = 'TSO LOGOFF'
-                        for p = data_start, field_end do
-                            local i = p - data_start + 1
-                            if i <= #text then
-                                screen:put(p, ebcdic.encode(text:sub(i, i)))
-                            else
-                                screen:put(p, 0x40)
-                            end
-                        end
-                        screen:set_mdt(attr_pos)
-                        screen.cursor = data_start + #text
-                        send_aid(client, AID_ENTER, screen)
-                        vim.wait(500, function() return false end)
-                    end
-                    pcall(function() client:shutdown() end)
-                    pcall(function() client:close() end)
-                end,
+                callback = function() M.disconnect() end,
             })
 
             vim.keymap.set('n', '<leader>h', function()
@@ -397,5 +646,21 @@ function M.connect()
         end)
     end)
 end
+
+function M.disconnect()
+    if not active then return end
+    pcall(function() active.run_logoff() end)
+    pcall(function() active.client:shutdown() end)
+    pcall(function() active.client:close() end)
+    active = nil
+end
+
+vim.api.nvim_create_user_command('TN3270', function(o)
+    local args = vim.split(o.args or '', '%s+', { trimempty = true })
+    local opts = {}
+    if args[1] and args[1] ~= '' then opts.host = args[1] end
+    if args[2] then opts.port = tonumber(args[2]) end
+    M.connect(opts)
+end, { nargs = '*' })
 
 return M

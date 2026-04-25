@@ -3,14 +3,6 @@ local ebcdic = require('tn3270.ebcdic')
 
 local M = {}
 
-function M.detect(screen)
-    local line0 = screen:to_lines()[1] or ''
-    if line0:find('REVEDIT') or line0:find('EDIT ') or line0:find('VIEW ') then
-        return 'revedit'
-    end
-    return 'normal'
-end
-
 function M.setup(buf, screen, submit)
     local function send_line_cmd(cmd_char, row)
         if screen.mode ~= 'revedit' then return end
