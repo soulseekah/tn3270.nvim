@@ -149,7 +149,7 @@ describe('Screen:sync_from_lines', function()
         s:set_mdt(0)
         local lines = {}
         for r = 1, 24 do lines[r] = string.rep(' ', 80) end
-        lines[1] = ' *' .. string.rep(' ', 78) -- vim shows masked
+        lines[1] = ' *' .. string.rep(' ', 78)
         s:sync_from_lines(lines)
         assert.equals(ebcdic.encode('S'), s.buffer[2]) -- preserved
         assert.is_truthy(bit.band(s.attrs[1], 0x01) ~= 0) -- MDT preserved

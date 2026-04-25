@@ -1,5 +1,7 @@
 # tn3270.nvim
 
+![tests](https://github.com/soulseekah/tn3270.nvim/actions/workflows/tests.yml/badge.svg?branch=trunk)
+
 A TN3270 terminal emulator for Neovim. Talk to mainframes (TSO/ISPF/REVEDIT)
 from inside vim, with vim ergonomics.
 
@@ -12,7 +14,6 @@ from inside vim, with vim ergonomics.
 - Mode-aware logoff: `:q` exits ISPF / REVEDIT, then LOGOFF, then closes
 - REVEDIT ergonomics: `o`/`O` insert line, `dd` delete, `yy`/`pp` copy/paste,
   `gg`/`G` top/bottom, `:LINE N` jump, `A` append-end-of-content
-- Password fields masked as `*`, captured chars sent on Enter
 - IND$FILE transfer (`:TN3270Save` / `:TN3270Load`) ; structured-field path
   implemented; some hosts still pick legacy mode
 
@@ -83,8 +84,16 @@ From TSO READY:
 
 ## Tests
 
+Tests run inside headless Neovim via plenary.nvim. Clone plenary once:
+
 ```sh
-brew install luarocks
-luarocks install busted
-busted
+git clone https://github.com/nvim-lua/plenary.nvim deps/plenary.nvim
+```
+
+Then:
+
+```sh
+nvim --headless -u tests/minimal_init.lua \
+    -c "PlenaryBustedDirectory tests {minimal_init='tests/minimal_init.lua'}" \
+    -c "qa!"
 ```
